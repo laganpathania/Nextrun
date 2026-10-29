@@ -1,0 +1,46 @@
+# Every number lives here, not in code.
+factors:
+  reagent_a:     {min: 1,   max: 60,  unit: units}
+  reagent_b:     {min: 1,   max: 60,  unit: units}
+  reaction_time: {min: 10,  max: 120, unit: min}
+  temperature:   {min: 20,  max: 40,  unit: C}
+  ph:            {min: 6.0, max: 8.0, unit: pH}
+
+constraints:
+  max_total_reagent: 100        # reagent_a + reagent_b <= this
+  min_pipette_volume: 2         # each reagent must be >= this
+  max_experiments: 48           # campaign budget
+  reagent_budget_total: 4000    # total reagent units for the campaign
+
+campaign:
+  initial_batch: 8
+  batch_size: 8
+  rounds: 6                     # 8 + 5*8 = 48 experiments
+
+planner:
+  n_candidates: 2000
+  min_points_for_gp: 4
+  w_time: 0.10                  # operational penalty: long reaction times
+  w_cost: 0.10                  # operational penalty: reagent use
+
+# Synthetic "biology", hidden from the planner. Documented in README.
+groundtruth:
+  peak: 10.0                    # max signal-to-background ratio
+  baseline: 1.0                 # ratio of 1 = no signal
+  optimum: {reagent_a: 35, reagent_b: 25, reaction_time: 70, temperature: 32, ph: 7.2}
+  width:   {reagent_a: 18, reagent_b: 18, reaction_time: 35, temperature: 5,  ph: 0.5}
+  noise_sd: 0.05                # multiplicative lognormal noise
+  fail_temp: 37                 # assay fails if temperature > this ...
+  fail_ph: 6.5                  # ... and pH < this
+  qc_outlier_prob: 0.05
+  qc_control_tolerance: 0.20
+
+instruments:
+  liquid_handler: {capacity: 1, failure_prob: 0.02, recovery_min: 15, prep_min: 12}
+  plate_mover:    {capacity: 1, failure_prob: 0.02, recovery_min: 10, move_min: 2}
+  incubator:      {capacity: 4, failure_prob: 0.0}
+  plate_reader:   {capacity: 1, failure_prob: 0.01, recovery_min: 10, read_min: 6}
+
+# Planned downtime, in minutes from the start of each batch. Starts once running jobs finish.
+maintenance:
+  incubator: {start_min: 150, duration_min: 30}
