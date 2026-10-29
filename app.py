@@ -1,21 +1,60 @@
-import time
-from pathlib import Path
-
+import logging
+import uuid
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
+import scipy.stats as stats
 import streamlit as st
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import GridSearchCV, KFold, cross_val_predict
+from sklearn.preprocessing import StandardScaler
 
-from labtwin.config import load_config
-from labtwin.devices import SPECS
-from labtwin.optimizer import Optimizer
-from labtwin.orchestrator import best_so_far, run_campaign
-from labtwin.realmode import (TYPES, build_workbook, clean_variables, new_rows_table, parse_data,
-                              read_upload)
+# ==========================================
+# SESSION & AUDIT LOGGING (browser console only, nothing stored)
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
-st.set_page_config(layout="wide", page_title="NextRun: Experiment Planner and Lab Simulator")
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
 
-GREEN, RED, AMBER, GREY = "#2d6a4f", "#bc4749", "#e09f3e", "#888780"
+def log_action(action: str, status: str = "SUCCESS", details: str = "") -> None:
+    user = st.session_state.session_id
+    logging.info(f"SESSION:{user} | ACTION:{action} | STATUS:{status} | DETAILS:{details}")
+
+st.set_page_config(layout="wide", page_title="BatchSight: Bioprocess Digital Twin")
+
+# ==========================================
+# BRANDING INJECTION (CUSTOM CSS)
+# ==========================================
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #fdfcf8; }
+    div[data-testid="metric-container"] {
+        background-color: rgba(255, 255, 255, 0.98); 
+        border: 1px solid rgba(45, 106, 79, 0.15);    
+        padding: 1.5rem; border-radius: 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.02);
+    }
+    div[data-testid="metric-container"] label { color: #354a3e !important; font-weight: 600; font-size: 1.05rem; }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color: #2d6a4f !important; }
+    div[data-testid="metric-container"] div[data-testid="stMetricDelta"] { color: #bc4749 !important; }
+    h1, h2, h3 { color: #2d6a4f !important; }
+    p, span, div { color: #0a140f; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { color: #354a3e; font-weight: 600; }
+    .stTabs [aria-selected="true"] { color: #2d6a4f !important; border-bottom-color: #2d6a4f !important; }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
 
 # ==========================================
 # BRAND SHELL: shared look of Lagan Pathania's tools
@@ -137,7 +176,8 @@ def brand_footer(note="Free exploratory tool, not validated for GxP decisions. D
         '<div>Lab Automation Architect | Hamburg, Germany</div>'
         '<div><a href="/" target="_top">Home</a>|<a href="/twin/" target="_top">BatchSight</a>|'
         '<a href="/autolab/" target="_top">NextRun</a>|<a href="mailto:hello@laganpathania.com">hello@laganpathania.com</a>|'
-        '<a href="https://www.linkedin.com/in/lagan-pathania-814142118/" target="_blank" rel="noopener noreferrer">LinkedIn</a></div>'
+        '<a href="https://www.linkedin.com/in/lagan-pathania-814142118/" target="_blank" rel="noopener noreferrer">LinkedIn</a>|'
+        '<a href="https://github.com/laganpathania/batchsight" target="_blank" rel="noopener noreferrer">Code on GitHub</a></div>'
         '<div><a href="/impressum.html" target="_top">Impressum</a>|<a href="/datenschutz.html" target="_top">Datenschutzerklärung</a></div>'
         f'<div class="lp-fine">© 2026 Lagan Pathania. {note}</div></div>',
         unsafe_allow_html=True)
@@ -147,502 +187,830 @@ def render_about():
     st.markdown(
         '<div class="lp-h">At a glance</div>'
         '<div class="lp-grid">'
-        '<div class="lp-card"><div class="lp-label">The challenge</div><p>Assay and process development consume reagent, '
-        'instrument time and weeks of effort, while the next experiment is often chosen by habit or by a fixed grid.</p></div>'
-        '<div class="lp-card"><div class="lp-label">The approach</div><p>A closed loop that learns from every result. '
-        'It proposes the most informative next batch, checks it against your limits, and updates its model after each round.</p></div>'
-        '<div class="lp-card"><div class="lp-label">The evidence</div><div class="lp-big">7.7 vs 3.8</div><p>Best signal-to-background after 48 '
-        'experiments, Bayesian optimization against random search, averaged over 10 simulated campaigns.</p></div></div>'
+        '<div class="lp-card"><div class="lp-label">The challenge</div><p>Fed-batch processes produce dense, '
+        'time-resolved data, yet batches are usually compared by eye and deviations surface after the run has finished.</p></div>'
+        '<div class="lp-card"><div class="lp-label">The approach</div><p>Mechanistic mass balances and multivariate '
+        'statistics, combined, so every batch is read against its own history and against process physics.</p></div>'
+        '<div class="lp-card"><div class="lp-label">The outcome</div><p>A clear view of which batches drift, which '
+        'variables drive yield or quality, and how the kinetics of each run behave.</p></div></div>'
 
-        '<div class="lp-h">The closed loop</div>'
-        '<div class="lp-lead">Each cycle follows the same disciplined sequence, and every step is written to a tamper-evident audit log.</div>'
-        '<div class="lp-flow"><span>Propose</span><i>&rarr;</i><span>Check feasibility</span><i>&rarr;</i><span>Human approval</span><i>&rarr;</i>'
-        '<span>Schedule on instruments</span><i>&rarr;</i><span>Measure</span><i>&rarr;</i><span>Quality control</span><i>&rarr;</i><span>Learn</span></div>'
-
-        '<div class="lp-h">Two ways to explore it</div>'
-        '<div class="lp-wrap"><table class="lp-table"><tr><th>Section</th><th>What you do</th><th>What you get</th></tr>'
-        '<tr><td>Demo</td><td>Run a simulated campaign with Bayesian optimization or random search</td>'
-        '<td>The learning curve, an instrument timeline with failures and maintenance, per-round utilization and the audit trail</td></tr>'
-        '<tr><td>Try with your data</td><td>Define your numeric variables and one goal, optionally upload past experiments (Excel or CSV)</td>'
-        '<td>The next batch of experiments, a downloadable Excel file to fill in, and a check of how well the model understands your data</td></tr>'
+        '<div class="lp-h">What is inside</div>'
+        '<div class="lp-lead">Five analysis modules work on the same dataset, from a first look at the trajectories to '
+        'a model-based view of where the process could move.</div>'
+        '<div class="lp-wrap"><table class="lp-table"><tr><th>Module</th><th>Question it answers</th><th>Method</th></tr>'
+        '<tr><td>Batch Evolution</td><td>How do runs compare over time?</td><td>Overlaid trajectories per variable, as concentration or absolute mass</td></tr>'
+        '<tr><td>Multivariate (PCA)</td><td>Which batches are unusual?</td><td>Principal component scores with a 95% Hotelling T&sup2; ellipse</td></tr>'
+        '<tr><td>Predictive (PLS)</td><td>What predicts yield or quality early?</td><td>PLS regression with cross-validated tuning and variable importance (VIP) tested by permutation</td></tr>'
+        '<tr><td>Kinetic (ODE)</td><td>What do growth and consumption rates look like?</td><td>Mechanistic ODE fit with feed and sampling events built into the mass balance</td></tr>'
+        '<tr><td>Prescriptive Optimizer</td><td>Where could controllable levers move the process?</td><td>Search within the PLS model for a target point, with a warning when it extrapolates</td></tr>'
         '</table></div>'
 
-        '<div class="lp-h">Reading the evidence honestly</div>',
-        unsafe_allow_html=True)
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        if Path("benchmark.png").exists():
-            st.image("benchmark.png", caption="Best result so far, mean and spread over 10 seeds, on a synthetic assay.")
-    with c2:
-        st.markdown(
-            '<ul class="lp-list">'
-            '<li>Bayesian optimization finished ahead, but the two methods are indistinguishable for roughly the first 35 experiments.</li>'
-            '<li>The assay is a function written for this project, so the result shows that the method works, not that it works on a real assay.</li>'
-            '<li>Single runs vary widely. Quote the average, not one run.</li>'
-            '</ul>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="lp-h">Method</div>'
-        '<div class="lp-lead">Early on, with too little data to fit a model, NextRun spreads experiments across your ranges. Once there are enough '
-        'results it fits a Gaussian process and chooses each batch by Expected Improvement, using the constant-liar approach so a batch does not '
-        'contain near-duplicates. Experiments that are planned but unfinished are treated as running.</div>'
+        '<div class="lp-h">How to use it</div>'
+        '<ol class="lp-list">'
+        '<li><b>Demo.</b> Explore the full workflow on simulated fed-batch data. Change the reactor assumptions in the side panel and watch every module respond.</li>'
+        '<li><b>Try with your data.</b> Upload a CSV with one row per time point: a batch identifier, a time column, your process variables and one target such as titer. Map the columns in the side panel.</li>'
+        '<li><b>Interpret and decide.</b> Use the results to frame questions for your process team, or bring them to a call and we will go through them together.</li>'
+        '</ol>'
 
         '<div class="lp-h">Scope and limits</div>'
         '<ul class="lp-list">'
-        '<li>One response at a time, with continuous or integer variables and simple minimum and maximum limits. Categorical variables, '
-        'rules linking variables and two goals at once are not supported yet.</li>'
-        '<li>No tool can say in advance how many experiments you will need. Watch the best-so-far curve and decide against your budget.</li>'
-        '<li>The simulated lab is a model, not validated against real instruments. The OPC UA interface of the full project is not part of this browser version.</li>'
-        '<li>A decision aid, not validated software. You remain responsible for what is run in the lab.</li>'
+        '<li>An exploratory tool. It is not validated for GxP decisions.</li>'
+        '<li>The Demo uses simulated data. Conclusions about a real process need real data.</li>'
+        '<li>Multivariate models need a dense batch history. With about 15 batches, cross-validation variance is high; production validation calls for more than 30.</li>'
+        '<li>The optimizer searches a correlational model. It points to hypotheses to test, not to proven causes.</li>'
         '</ul>'
 
         '<div class="lp-h">Your data stays with you</div>'
-        '<div class="lp-lead">Everything is calculated in your browser. Your files are not uploaded to a server.</div>',
+        '<div class="lp-lead">The analysis runs entirely in your browser. Your CSV is never uploaded to a server and is gone when you close the tab. '
+        'Please still anonymise batch identifiers before uploading.</div>',
         unsafe_allow_html=True)
-    cta_band("Want a planner like this connected to your own assay and instruments? Book a free 30-minute call.")
+    st.markdown(
+        '<div class="lp-h">Open source</div>'
+        '<div class="lp-lead">The full source code is on GitHub. <a href="https://github.com/laganpathania/batchsight" target="_blank" rel="noopener noreferrer">Read the code</a></div>',
+        unsafe_allow_html=True)
+    cta_band()
 
 
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #fdfcf8; }
-    div[data-testid="metric-container"] {
-        background-color: rgba(255,255,255,0.98); border: 1px solid rgba(45,106,79,0.15);
-        padding: 1.2rem; border-radius: 16px; box-shadow: 0 8px 30px rgba(0,0,0,0.02);
-    }
-    div[data-testid="metric-container"] label { color: #354a3e !important; font-weight: 600; }
-    div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color: #2d6a4f !important; }
-    h1, h2, h3 { color: #2d6a4f !important; }
-    p, span, div { color: #0a140f; }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] { color: #354a3e; font-weight: 600; }
-    .stTabs [aria-selected="true"] { color: #2d6a4f !important; border-bottom-color: #2d6a4f !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+# ==========================================
+# GLOBAL VISUAL STYLE (PUBLICATION GRADE)
+# ==========================================
+pub_font_family = "Georgia, 'Times New Roman', serif"
+
+pub_layout = dict(
+    template="simple_white",
+    dragmode="zoom",
+    font=dict(family=pub_font_family, size=12, color="#1a1a1a"),
+    xaxis=dict(
+        showline=True, linewidth=1, linecolor="black", mirror=True, 
+        ticks="outside", showgrid=False, zeroline=False, 
+        title_font=dict(size=12, color="#1a1a1a"), tickfont=dict(color="#1a1a1a"),
+        fixedrange=False
+    ),
+    yaxis=dict(
+        showline=True, linewidth=1, linecolor="black", mirror=True, 
+        ticks="outside", showgrid=False, zeroline=False, 
+        title_font=dict(size=12, color="#1a1a1a"), tickfont=dict(color="#1a1a1a"),
+        fixedrange=False
+    ),
+    legend=dict(bordercolor="black", borderwidth=0.75, font=dict(size=10, color="#1a1a1a")),
+    plot_bgcolor="white", 
+    paper_bgcolor="white",
+    margin=dict(t=50, l=60, r=30, b=50)
 )
 
-STATE_COLORS = {
-    "running": GREEN, "measuring": GREEN, "transferring": GREEN, "occupied": GREEN,
-    "error": RED, "blocked": RED, "maintenance": AMBER,
-}
 
+# ==========================================
+# MATH CORE: FED-BATCH & MVDA ENGINE
+# ==========================================
+@st.cache_data
+def generate_fed_batch_data(init_vol: float, feed_rate: float, samp_vol: float) -> pd.DataFrame:
+    np.random.seed(42)
+    batches = [f"Batch_{i:02d}" for i in range(1, 16)]
+    data = []
+    
+    # Base kinetic parameters for synthetic generation
+    mu_max_base, Ks_base, Y_xs_base = 0.05, 5.0, 0.5
+    kd_base, alpha_base, beta_base = 0.01, 0.05, 0.01
+    s_in_basal, s_in_gluc = 50.0, 400.0
 
-def segments(timeline):
-    """Turn the device-state event list into (device, state, start, duration) bars."""
-    by = {}
-    for e in sorted(timeline, key=lambda e: e["t"]):
-        by.setdefault(e["device"], []).append(e)
-    end = max(e["t"] for e in timeline)
-    rows = []
-    for dev, evs in by.items():
-        for a, b in zip(evs, evs[1:] + [None]):
-            t1 = b["t"] if b else end
-            if a["state"] != SPECS[dev]["idle"] and t1 > a["t"]:
-                rows.append({"device": dev, "state": a["state"], "start": a["t"], "dur": t1 - a["t"]})
-    return pd.DataFrame(rows)
+    for batch in batches:
+        passage_num = np.random.randint(25, 45)
+        seed_vcd = np.random.uniform(0.3, 0.8)
+        seed_viability = np.random.uniform(95.0, 99.9)
+        
+        excursion = "None"
+        if batch == "Batch_04": excursion = "Contamination"
+        if batch == "Batch_12": excursion = "Feed Pump Fault"
 
+        perf_mult = np.random.uniform(0.85, 1.15)
+        dur_hrs = np.random.randint(300, 350)
+        timepoints = np.arange(0, dur_hrs, 24)
+        
+        # Initialize physical states
+        Xv_curr = seed_vcd
+        S_curr = 40.0
+        V_curr = init_vol
+        P_curr = 0.0
+        
+        cum_feed_basal = 0.0
+        cum_feed_gluc = 0.0
+        cum_base = 0.0
 
-def run(strategy, seed, rounds, progress=None):
-    cfg = load_config()
-    cfg["campaign"]["rounds"] = int(rounds)
-    return run_campaign(cfg, strategy, int(seed), progress=progress)
+        for t in timepoints:
+            is_contaminated = (excursion == "Contamination" and t >= 120)
+            is_feed_fault = (excursion == "Feed Pump Fault" and t >= 100)
+            
+            if t > 0:
+                # 1. Continuous Biological Phase
+                current_kd = kd_base * 4.0 if is_contaminated else kd_base
+                current_mu_max = mu_max_base * perf_mult
+                
+                t_span = [t - 24, t]
+                sol = odeint(batch_ode, [Xv_curr, S_curr, V_curr, P_curr], t_span, 
+                             args=(current_mu_max, Ks_base, Y_xs_base, current_kd, alpha_base, beta_base))
+                
+                Xv_curr, S_curr, V_curr, P_curr = sol[-1]
+                
+                # 2. Volume sampling removal (pre-feed)
+                V_curr = max(0.01, V_curr - samp_vol)
 
+                # 3. Discrete Feed Phase (Mass Balance Jump)
+                current_feed_rate = 0.0 if is_feed_fault else feed_rate
+                interval_basal = current_feed_rate * 16
+                interval_gluc = current_feed_rate * 8
+                
+                if interval_basal > 0 or interval_gluc > 0:
+                    V_new = V_curr + interval_basal + interval_gluc
+                    Xv_curr = Xv_curr * V_curr / V_new
+                    S_curr = (S_curr * V_curr + (interval_basal * s_in_basal) + (interval_gluc * s_in_gluc)) / V_new
+                    P_curr = P_curr * V_curr / V_new
+                    V_curr = V_new
+                    
+                    cum_feed_basal += interval_basal
+                    cum_feed_gluc += interval_gluc
+                    
+           # 4. Generate observable data with measurement noise
+            vcd = max(0.0, Xv_curr + np.random.normal(0, 0.15))
+            glucose = max(0.0, S_curr + np.random.normal(0, 0.5))
+            titer = max(0.0, P_curr + np.random.normal(0, 0.02))
+            
+            # --- EXCURSION 1: CONTAMINATION (Batch_04, t >= 120) ---
+            # Acute septic cell lysis and titer degradation
+            if is_contaminated:
+                dt_contam = t - 120
+                vcd = max(0.0, vcd * np.exp(-0.06 * dt_contam))
+                titer = max(0.0, titer * np.exp(-0.04 * dt_contam))
+            
+            # --- EXCURSION 2: FEED PUMP FAULT (Batch_12, t >= 136) ---
+            # Substrate starvation and growth cessation
+            if is_feed_fault:
+                dt_fault = t - 100
+                glucose = max(0.0, glucose - (3 * dt_fault))
+                vcd = max(0.0, vcd * np.exp(-0.06 * dt_fault))
+            
+            # --- SECONDARY CQAs & ANALYTICS ---
+            viability = 99.0 - max(0, (t - 150) * 0.1) + np.random.normal(0, 1)
+            if is_contaminated:
+                viability = max(0.0, viability - (1.8 * (t - 120)))  # Severe septic death
+            if is_feed_fault:
+                viability = max(0.0, viability - (1.0 * (t - 100)))  # Starvation death
+            viability = max(0.0, min(100.0, viability))
+                
+            lactate = min(30, 2 + (0.1 * t * perf_mult) + np.random.normal(0, 1))
+            if is_contaminated:
+                lactate = min(40.0, lactate + (0.5 * (t - 120)))     # Lactic acidosis surge
+            if is_feed_fault:
+                lactate = max(0.5, lactate - (0.15 * (t - 100)))     # Metabolic shift
+                
+            ammonia = min(5, 0.5 + (0.01 * t) + np.random.normal(0, 0.2))
+            if is_contaminated:
+                ammonia = min(15.0, ammonia + (0.15 * (t - 120)))    # Deamination spike
+                
+            glutamine = max(0, 8 - (0.03 * t) + np.random.normal(0, 0.5))
+            
+            base_rate = max(0, (lactate - 10) * 0.01) if lactate > 10 else 0
+            if t > 0: cum_base += base_rate * 24 + np.random.uniform(0, 0.05)
+            
+            osmolality = 300 + (t * 0.4) + (cum_base * 20) + np.random.normal(0, 5)
+            temp = 36.5 + np.random.normal(0, 0.1)
+            agitation = 150 + np.random.normal(0, 5)
 
-brand_header("NextRun", "NextRun", "Stop guessing your next experiment. Every run teaches the next.",
-             "Experiment planning with Bayesian optimization")
-section = section_nav()
+            aggregation = max(0, min(100, 1.0 + (osmolality - 300)*0.05 + max(0, temp - 36.5)*2 + (t/100) + np.random.normal(0, 0.5)))
+            fragmentation = max(0, 0.5 + (agitation - 150)*0.1 + (t/100) + np.random.normal(0, 0.5))
 
-# ------------------------------------------------------------------------------------------
-# Real mode: optimize your own experiment
-# ------------------------------------------------------------------------------------------
-DEFAULT_VARS = pd.DataFrame([
-    {"name": "Temperature (C)", "min": 20.0, "max": 40.0, "type": "continuous"},
-    {"name": "pH", "min": 6.0, "max": 8.0, "type": "continuous"},
-    {"name": "Time (min)", "min": 10.0, "max": 120.0, "type": "integer"},
-])
-
-
-def example_dataset():
-    """10 made-up experiments from a hidden smooth function, so visitors can try the flow."""
-    variables = clean_variables(DEFAULT_VARS)[0]
-    opt = Optimizer(variables, True, 7)
-    pts = opt.suggest(np.empty((0, 3)), [], 10)["points"]
-    rng = np.random.default_rng(7)
-    z = ((pts[:, 0] - 31) / 6) ** 2 + ((pts[:, 1] - 7.1) / 0.6) ** 2 + ((pts[:, 2] - 75) / 35) ** 2
-    y = 100 * np.exp(-z) * np.exp(rng.normal(0, 0.03, len(pts)))
-    d = pd.DataFrame(pts, columns=[v["name"] for v in variables])
-    d["Time (min)"] = d["Time (min)"].astype(int)
-    d["Yield (%)"] = np.round(y, 2)
-    return d
-
-
-def init_real():
-    ss = st.session_state
-    ss.setdefault("vars_df", DEFAULT_VARS.copy())
-    ss.setdefault("vars_ver", 0)
-    ss.setdefault("resp_name", "Yield (%)")
-    ss.setdefault("goal", "Maximize")
-    ss.setdefault("data_raw", None)
-    ss.setdefault("data_src", "")
-    ss.setdefault("up_sig", None)
-    ss.setdefault("up_ver", 0)
-    ss.setdefault("real_out", None)
-
-
-def reset_variables(df):
-    ss = st.session_state
-    ss["vars_df"] = df
-    ss["vars_ver"] += 1
-
-
-if section == "Try with your data":
-    init_real()
-    ss = st.session_state
-    st.markdown(
-        "Plan the next experiments for **your own** process. Tell the tool your variables and goal, optionally "
-        "upload what you have already measured, and it suggests what to run next. Run those in your lab, add the "
-        "results to the Excel file you download, and upload it again for the next round. "
-        "**Your data stays in your browser.**"
-    )
-
-    # ---- 1. file or example ----
-    with st.container(border=True):
-        st.markdown("##### 1 · Start from a file (optional)")
-        f1, f2 = st.columns([3, 1])
-        up = f1.file_uploader("Excel or CSV with your experiments, or the file this tool gave you last round",
-                              type=["xlsx", "csv"], key=f"up_file_{ss['up_ver']}")
-        f2.write("")
-        f2.write("")
-        if f2.button("Load example data", use_container_width=True):
-            reset_variables(DEFAULT_VARS.copy())
-            ss["resp_name"], ss["goal"] = "Yield (%)", "Maximize"
-            ss["data_raw"], ss["data_src"], ss["up_sig"], ss["real_out"] = example_dataset(), "example data", None, None
-            ss["up_ver"] += 1  # new key = empty uploader, so a previously uploaded file cannot override the example
-            st.rerun()
-        if up is not None:
-            sig = (up.name, up.size)
-            if ss["up_sig"] != sig:
-                try:
-                    data, settings = read_upload(up.name, up.getvalue())
-                    ss["data_raw"], ss["data_src"], ss["up_sig"], ss["real_out"] = data, up.name, sig, None
-                    if settings:
-                        reset_variables(settings["variables"])
-                        ss["resp_name"], ss["goal"] = settings["response"], settings["goal"]
-                    st.rerun()
-                except Exception as e:
-                    ss["up_sig"] = sig
-                    st.error(f"Could not read that file: {e}")
-        elif ss["up_sig"] is not None:  # the file was removed with the x
-            ss["data_raw"], ss["data_src"], ss["up_sig"], ss["real_out"] = None, "", None, None
-        if ss["data_raw"] is not None and up is None:
-            if st.button("Remove the example data"):
-                ss["data_raw"], ss["data_src"], ss["real_out"] = None, "", None
-                st.rerun()
-        st.caption("Files saved by this tool carry a Settings sheet, so your variables and goal load automatically. "
-                   "For your own Excel or CSV, one row per experiment, one column per variable, plus a response "
-                   "column. Leave the response blank for experiments that are planned or still running.")
-
-    # ---- 2. variables and goal ----
-    with st.container(border=True):
-        st.markdown("##### 2 · Your variables and goal")
-        edited = st.data_editor(
-            ss["vars_df"], key=f"vars_{ss['vars_ver']}", num_rows="dynamic", hide_index=True,
-            use_container_width=True,
-            column_config={
-                "name": st.column_config.TextColumn("Variable", help="Must match the column name in your file"),
-                "min": st.column_config.NumberColumn("Min"),
-                "max": st.column_config.NumberColumn("Max"),
-                "type": st.column_config.SelectboxColumn("Type", options=list(TYPES)),
+            our = max(0, (vcd * 0.8) + np.random.normal(0, 0.5))
+            if is_feed_fault:
+                our *= np.exp(-0.04 * (t - 100))                     # Respiration decay
+            cer = max(0, (our * 0.9) + np.random.normal(0, 0.3))
+            
+            ph = 7.0 - (lactate * 0.01) + (base_rate * 10) + np.random.normal(0, 0.02)
+            do = 40.0 - (our * 0.5) + np.random.normal(0, 2)
+            data.append({
+                "Batch": batch, "Excursion": excursion, "Time_Hours": t, "Volume": V_curr,
+                "Passage_Number": passage_num, "Seed_VCD": seed_vcd, "Seed_Viability": seed_viability,
+                "VCD": vcd, "Viability": viability, "Glucose": glucose, "Lactate": lactate, 
+                "Ammonia": ammonia, "Glutamine": glutamine, "Osmolality": osmolality, 
+                "Titer": titer, "Aggregation": aggregation, "Fragmentation": fragmentation,
+                "pH": ph, "DO": do, "Temperature": temp, "Agitation": agitation,
+                "OUR": our, "CER": cer, "Base_Volume": cum_base,
+                "Feed_Volume_Basal": cum_feed_basal, "Feed_Volume_Glucose": cum_feed_gluc
             })
-        st.caption("Add or delete rows to change the number of variables. Integer variables are only ever "
-                   "suggested as whole numbers.")
-        g1, g2 = st.columns([2, 1])
-        resp = g1.text_input("Response name (the column holding your results)", key="resp_name").strip()
-        goal = g2.radio("Goal", ["Maximize", "Minimize"], key="goal", horizontal=True)
-        variables, verr = clean_variables(edited)
-        names = [v["name"] for v in variables]
-        if not resp:
-            verr.append("Give the response a name.")
-        elif resp.lower() in [n.lower() for n in names]:
-            verr.append("The response name must differ from the variable names.")
-        for e in verr:
-            st.error(e)
-
-        parsed, derr = None, None
-        if ss["data_raw"] is not None and not verr:
-            try:
-                parsed = parse_data(ss["data_raw"], variables, resp)
-            except Exception as e:
-                derr = str(e)
-        if derr:
-            st.error(derr)
-        elif parsed is not None:
-            st.success(f"Using {parsed['n_done']} finished experiment(s) from {ss['data_src']}"
-                       + (f" and {parsed['n_pending']} pending (no result yet)." if parsed["n_pending"] else "."))
-            for w in parsed["warnings"]:
-                st.warning(w)
-            with st.expander("Preview your data"):
-                st.dataframe(parsed["table"], hide_index=True, use_container_width=True)
-        if len(variables) > 8:
-            st.warning("With more than about 8 variables, Bayesian optimization needs many experiments to help. "
-                       "Consider fixing the least important variables.")
-
-    # ---- 3. settings + run ----
-    with st.container(border=True):
-        st.markdown("##### 3 · Suggest the next experiments")
-        s1, s2, s3 = st.columns(3)
-        batch = s1.slider("Experiments to suggest", 1, 12, 4, key="real_batch")
-        planner = s2.radio("Planner", ["Bayesian optimization", "Random search"], key="real_planner")
-        seed = s3.number_input("Seed", min_value=0, max_value=9999, value=1, step=1, key="real_seed",
-                               help="Same data and same seed give the same suggestions.")
-        ok = not verr and derr is None
-        sig_now = repr((variables, resp, goal, batch, planner, int(seed),
-                        None if parsed is None else pd.util.hash_pandas_object(parsed["table"].astype(str)).sum()))
-        if parsed is not None and parsed["n_done"] > 400:
-            st.warning("More than 400 results will make the model slow in a browser.")
-        clicked = st.button("Suggest next experiments", type="primary", disabled=not ok)
-
-    if clicked and ok:
-        with st.spinner("Fitting the model and choosing experiments…"):
-            maximize = goal == "Maximize"
-            X = parsed["X"] if parsed else np.empty((0, len(variables)))
-            y = parsed["y"] if parsed else np.array([])
-            P = parsed["pending"] if parsed else np.empty((0, len(variables)))
-            opt = Optimizer(variables, maximize, int(seed))
-            try:
-                out = opt.suggest(X, y, batch, pending=P,
-                                  strategy="random" if planner.startswith("Random") else "auto")
-                check = opt.model_check(X, y) if len(y) >= 5 else None
-            except Exception as e:
-                out, check = None, None
-                st.error(str(e))
-        if out is not None:
-            new = new_rows_table(variables, resp, out["points"])
-            show = new.copy()
-            if out["pred_mean"] is not None:
-                show[f"predicted {resp}"] = np.round(out["pred_mean"], 3)
-                show["± 1 sd"] = np.round(out["pred_std"], 3)
-            show["why"] = out["reasons"]
-            xlsx = build_workbook(variables, resp, maximize, parsed["table"] if parsed else None, show)
-            ss["real_out"] = {"sig": sig_now, "out": out, "check": check, "show": show, "xlsx": xlsx,
-                              "variables": variables, "resp": resp, "maximize": maximize,
-                              "y": y, "n_pending": 0 if parsed is None else parsed["n_pending"]}
-
-    R = ss["real_out"]
-    if R:
-        if R["sig"] != sig_now:
-            st.warning("You changed the inputs since these suggestions were made. Press **Suggest next "
-                       "experiments** again to refresh them.")
-        out, y, resp_r = R["out"], R["y"], R["resp"]
-        label = {"bayesian": "Bayesian optimization", "space-filling": "Space-filling design",
-                 "random": "Random search"}[out["mode"]]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Finished experiments", len(y))
-        if len(y):
-            best = y.max() if R["maximize"] else y.min()
-            m2.metric(f"Best {resp_r}", f"{best:.4g}")
-        else:
-            m2.metric(f"Best {resp_r}", "none yet")
-        m3.metric("Method used", label)
-        m4.metric("Model's expected gain", "n/a" if out["ei_frac"] is None else f"{out['ei_frac']:.1%}",
-                  help="The largest Expected Improvement over your best result, as a share of the spread of your "
-                       "results. Near zero hints that little is left to gain, but it is a hint, not proof.")
-        for n in out["notes"]:
-            st.info(n)
-
-        t_sug, t_data, t_model = st.tabs(["Suggested experiments", "Your data", "Model check"])
-        with t_sug:
-            st.dataframe(R["show"], hide_index=True, use_container_width=True)
-            d1, d2 = st.columns(2)
-            d1.download_button("Download Excel (suggestions + all data + settings)", R["xlsx"],
-                               file_name="nextrun_next_experiments.xlsx", type="primary", use_container_width=True,
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            d2.download_button("Download suggestions as CSV", R["show"].to_csv(index=False).encode(),
-                               file_name="nextrun_next_experiments.csv", mime="text/csv", use_container_width=True)
-            st.caption("Next: run these, type each result into the highlighted cells of the **All data** sheet, save, "
-                       "and upload that file at step 1. Predictions are the model's guess before you measure.")
-        with t_data:
-            if len(y):
-                idx = list(range(1, len(y) + 1))
-                run_best = np.maximum.accumulate(y) if R["maximize"] else np.minimum.accumulate(y)
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=idx, y=y, mode="markers", name="Result", marker=dict(color=GREY, size=8)))
-                fig.add_trace(go.Scatter(x=idx, y=run_best, mode="lines", name="Best so far",
-                                         line=dict(color=GREEN, width=3, shape="hv")))
-                fig.update_layout(template="simple_white", height=380, xaxis_title="Experiment number (row order)",
-                                  yaxis_title=resp_r, legend=dict(orientation="h", y=1.12),
-                                  margin=dict(l=10, r=10, t=30, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No finished experiments yet. Add results and upload the file again.")
-        with t_model:
-            chk = R["check"]
-            if chk is None:
-                st.info("The model check needs at least 5 finished experiments.")
-            else:
-                k1, k2 = st.columns(2)
-                k1.metric("Prediction quality (R²)", f"{chk['cv_r2']:.2f}",
-                          help=f"Each result is predicted from the others ({chk['cv_method']}). 1 is perfect, "
-                               "0 is no better than the average, below 0 is worse.")
-                k2.metric("Typical error (RMSE)", f"{chk['cv_rmse']:.3g}")
-                if chk["cv_r2"] < 0.5:
-                    st.warning("The model does not predict your results well yet. Treat its suggestions as "
-                               "exploration, and keep collecting data.")
-                c1, c2 = st.columns(2)
-                fig = go.Figure()
-                lo, hi = float(min(y.min(), chk["cv_pred"].min())), float(max(y.max(), chk["cv_pred"].max()))
-                fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="perfect",
-                                         line=dict(color=GREY, dash="dash")))
-                fig.add_trace(go.Scatter(x=chk["cv_pred"], y=y, mode="markers", name="experiments",
-                                         marker=dict(color=GREEN, size=9)))
-                fig.update_layout(template="simple_white", height=340, showlegend=False,
-                                  xaxis_title="Predicted from the other experiments", yaxis_title=f"Measured {resp_r}",
-                                  margin=dict(l=10, r=10, t=30, b=10), title="Predicted vs measured")
-                c1.plotly_chart(fig, use_container_width=True)
-                inf = pd.Series(chk["influence"]).sort_values()
-                fig = go.Figure(go.Bar(x=inf.values, y=inf.index, orientation="h", marker_color=GREEN))
-                fig.update_layout(template="simple_white", height=340, xaxis_title="Share of influence",
-                                  margin=dict(l=10, r=10, t=30, b=10), title="Which variables matter (rough)",
-                                  xaxis_tickformat=".0%")
-                c2.plotly_chart(fig, use_container_width=True)
-                flat = [k for k, v in chk["flat"].items() if v]
-                if flat:
-                    st.caption("No detectable effect yet from: " + ", ".join(flat) + ". With few experiments this can "
-                               "simply mean not enough data.")
-                st.caption("Influence comes from the model's length scales and is a rough guide, not a statistical test.")
-
-    with st.expander("How this works, and what it cannot do"):
-        st.markdown(
-            """
-- **First experiments.** With fewer finished experiments than about twice the number of variables (minimum 5), a model
-  would mostly be guessing, so the tool suggests a space-filling design that covers your ranges. Expect these early
-  runs to look exploratory and not obviously good. In my tests on a smooth 3-variable problem, random search was
-  ahead after about 12 experiments, and Bayesian optimization pulled ahead by about 30 (13 of 16 runs).
-- **Then Bayesian optimization.** A Gaussian process learns from your results. Each suggestion maximizes Expected
-  Improvement, balancing the best predicted region against regions the model is unsure about. A batch is chosen with
-  the constant-liar trick so the suggestions are not near-duplicates. Experiments with no result yet are treated as
-  running, so they are not suggested again.
-- **No promise of how many experiments you need.** Nobody can know that in advance. Watch the best-so-far curve and
-  the model's expected gain, and stop when your budget or your patience is gone.
-- **Limits.** One response at a time. Only continuous and integer variables with simple min and max (no categorical
-  choices, no rules linking variables, such as "A + B ≤ 100"). Noisy results are fine, but replicates help. The tool
-  is a decision aid, not validated software: you stay responsible for what is run in the lab.
-            """
-        )
+    return pd.DataFrame(data)
 
 
+def clean_numeric_data(df: pd.DataFrame, cols: list) -> tuple:
+    df_clean = df.copy()
+    initial_rows = len(df_clean)
+    for c in cols:
+        extracted = df_clean[c].astype(str).str.extract(r"([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?)")[0]
+        df_clean[c] = pd.to_numeric(extracted, errors="coerce")
+    df_clean = df_clean.dropna(subset=cols)
+    return df_clean, initial_rows - len(df_clean)
 
-if section == "Demo":
-    st.markdown('<div class="lp-lead" style="margin-top:1.2rem">A simulated lab with four instruments, random failures, a maintenance window and quality control. Run a full campaign and inspect what the planner learned, how the instruments were used, and the audit trail behind every decision.</div>', unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns([1.3, 1, 1.3, 1.2])
-    strategy = c1.radio("Planner", ["Bayesian optimization", "Random search"], horizontal=False)
-    seed = c2.number_input("Random seed", min_value=0, max_value=9999, value=1, step=1)
-    rounds = c3.slider("Rounds (8 experiments each)", 1, 6, 3,
-                       help="6 rounds = the full 48-experiment budget. More rounds take longer in the browser.")
-    compare = c4.checkbox("Also run random search with the same seed", value=True)
-    go_btn = c4.button("Run campaign", type="primary", use_container_width=True)
 
-    if go_btn:
-        strat = "bo" if strategy.startswith("Bayesian") else "random"
-        bar = st.progress(0.0, text="Starting campaign…")
-        t0 = time.time()
+@st.cache_data
+def interpolate_batch_trajectories(df: pd.DataFrame, batch_col: str, time_col: str, dynamic_features: list, static_features: list, target_times: np.ndarray) -> tuple:
+    unfolded_rows, valid_batches = [], []
+    for b in df[batch_col].unique():
+        b_df = df[df[batch_col] == b].sort_values(time_col)
+        if b_df[time_col].max() < target_times[-1]:
+            continue
+        
+        interp_vals = [b]
+        for sf in static_features:
+            interp_vals.append(b_df[sf].iloc[0])
+            
+        for f in dynamic_features:
+            interp_vals.extend(np.interp(target_times, b_df[time_col], b_df[f], left=np.nan, right=np.nan))
+            
+        unfolded_rows.append(interp_vals)
+        valid_batches.append(b)
+        
+    cols = ["Batch"] + static_features + [f"{f}_Hr{int(t)}" for f in dynamic_features for t in target_times]
+    return pd.DataFrame(unfolded_rows, columns=cols).set_index("Batch"), valid_batches
 
-        def tick(done, total):
-            bar.progress(done / total, text=f"Round {done} of {total} complete ({time.time() - t0:.0f} s)")
 
-        main_res = run(strat, seed, rounds, tick)
-        base_res = run("random", seed, rounds) if compare and strat == "bo" else None
-        bar.empty()
-        st.session_state["res"] = {"main": main_res, "base": base_res, "strat": strat,
-                                   "secs": time.time() - t0, "seed": int(seed), "rounds": int(rounds)}
+def draw_hotellings_t2_ellipse(X_pca: np.ndarray, n_samples: int, k_comp: int, confidence: float = 0.95) -> tuple:
+    if n_samples <= k_comp: return None, None
+    f_val = stats.f.ppf(confidence, k_comp, n_samples - k_comp)
+    t2_val = ((k_comp * (n_samples - 1) * (n_samples + 1)) / (n_samples * (n_samples - k_comp)) * f_val)
+    std_dev = np.std(X_pca, axis=0)
+    theta = np.linspace(0, 2 * np.pi, 100)
+    x_ellipse = std_dev[0] * np.sqrt(t2_val) * np.cos(theta)
+    y_ellipse = std_dev[1] * np.sqrt(t2_val) * np.sin(theta)
+    return x_ellipse, y_ellipse
 
-    S = st.session_state.get("res")
-    if not S:
-        st.info("Choose settings and press **Run campaign**. Bayesian optimization with 3 rounds usually takes "
-                "10 to 60 seconds in the browser; the first run is the slowest.")
-    else:
-        res = S["main"]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Experiments run", res["n_run"])
-        m2.metric("Best signal-to-background", f"{res['best']:.2f}", help="1.0 means no signal. The hidden optimum is about 10.")
-        m3.metric("Stop reason", res["stop_reason"].replace("_", " "))
-        m4.metric("Audit chain intact", "yes" if res["audit"].verify_chain() else "NO")
-        st.caption(f"Computed in {S['secs']:.0f} s. Seed {S['seed']}, {S['rounds']} rounds.")
 
-        t_prog, t_inst, t_exp, t_audit = st.tabs(
-            ["Learning curve", "Instruments", "Experiments", "Audit trail"])
+@st.cache_data
+def robust_pls_pipeline(X: np.ndarray, y: np.ndarray) -> tuple:
+    inner_cv = KFold(n_splits=3, shuffle=True, random_state=42)
+    param_grid = {"n_components": range(1, min(X.shape[0] - 1, X.shape[1], 5))}
+    grid_search = GridSearchCV(PLSRegression(), param_grid, cv=inner_cv, scoring="neg_mean_squared_error")
+    outer_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    y_pred = cross_val_predict(grid_search, X, y, cv=outer_cv)
+    rmsecv = np.sqrt(mean_squared_error(y, y_pred))
+    grid_search.fit(X, y)
+    return (grid_search.best_estimator_, rmsecv, grid_search.best_params_["n_components"], y_pred)
 
-        with t_prog:
-            fig = go.Figure()
-            if S["base"] is not None:
-                b = best_so_far(S["base"]["records"])
-                fig.add_trace(go.Scatter(x=list(range(1, len(b) + 1)), y=b, mode="lines",
-                                         name="Random search", line=dict(color=GREY, width=2, shape="hv")))
-            y = best_so_far(res["records"])
-            name = "Bayesian optimization" if S["strat"] == "bo" else "Random search"
-            fig.add_trace(go.Scatter(x=list(range(1, len(y) + 1)), y=y, mode="lines+markers", name=name,
-                                     line=dict(color=GREEN, width=3, shape="hv"), marker=dict(size=5)))
-            fig.update_layout(template="simple_white", height=420,
-                              xaxis_title="Experiments run", yaxis_title="Best signal-to-background so far",
-                              legend=dict(orientation="h", y=1.1), margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("A single run is noisy. The benchmark in the About section averages 10 seeds.")
-            if res["best_factors"]:
-                st.markdown("**Best conditions found**")
-                st.dataframe(pd.DataFrame([{k: round(v, 2) for k, v in res["best_factors"].items()}]),
-                             hide_index=True, use_container_width=True)
 
-        with t_inst:
-            if res["timeline"]:
-                seg = segments(res["timeline"])
-                fig = go.Figure()
-                for state, grp in seg.groupby("state"):
-                    fig.add_trace(go.Bar(y=grp["device"], x=grp["dur"], base=grp["start"], orientation="h",
-                                         name=state, marker_color=STATE_COLORS.get(state, GREEN),
-                                         hovertemplate="%{y}: " + state + "<br>start %{base:.0f} min<br>%{x:.0f} min<extra></extra>"))
-                fig.update_layout(template="simple_white", barmode="overlay", height=340,
-                                  xaxis_title="Simulated minutes", margin=dict(l=10, r=10, t=10, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-                st.caption("Green: busy. Red: fault or blocked. Amber: planned maintenance. The incubator only shows "
-                           "'occupied' when all 4 slots are full.")
-            rd = pd.DataFrame([{"round": r["round"] + 1, "makespan (min)": round(r["makespan"]),
-                                "bottleneck": r["bottleneck"], "mean queue wait (min)": round(r["mean_wait"], 1),
-                                **{f"{k} util.": f"{v:.0%}" for k, v in r["utilization"].items()}}
-                               for r in res["rounds"]])
-            st.dataframe(rd, hide_index=True, use_container_width=True)
+@st.cache_data
+def permutation_test_vip(_model: PLSRegression, X: np.ndarray, y: np.ndarray, n_components: int, n_permutations: int = 100) -> tuple:
+    rng = np.random.RandomState(42)
+    def calc_vips(m, X_dat):
+        t, w, q = m.x_scores_, m.x_weights_, m.y_loadings_
+        p, h = w.shape
+        vips = np.zeros((p,))
+        s = np.diag(t.T @ t @ q.T @ q).reshape(h, -1)
+        total_s = np.sum(s)
+        for i in range(p):
+            weight = np.array([(w[i, j] / np.linalg.norm(w[:, j])) ** 2 for j in range(h)])
+            vips[i] = np.sqrt(p * (s.T @ weight) / total_s).item()
+        return vips
 
-        with t_exp:
-            rows = []
-            for i, r in enumerate(res["records"]):
-                rows.append({"#": i + 1, "status": r["status"],
-                             "signal": None if r["value"] is None else round(r["value"], 2),
-                             **{k: round(v, 1) for k, v in r["factors"].items()}})
-            df = pd.DataFrame(rows)
-            st.dataframe(df, hide_index=True, use_container_width=True)
-            st.caption("Instrument errors and QC failures are excluded from learning. Assay failures (the hidden "
-                       "chemistry failure region) stay in, with their no-signal value.")
+    actual_vips = calc_vips(_model, X)
+    permuted_vips = np.zeros((n_permutations, X.shape[1]))
+    
+    for i in range(n_permutations):
+        pls_perm = PLSRegression(n_components=n_components)
+        pls_perm.fit(X, rng.permutation(y))
+        permuted_vips[i, :] = calc_vips(pls_perm, X)
 
-        with t_audit:
-            con = res["audit"].con
-            st.markdown("**Batches** (each moves PROPOSED → FEASIBILITY_CHECKED → APPROVED → RUNNING → MEASURED → LEARNED)")
-            st.dataframe(pd.read_sql_query(
-                "SELECT id, state, planner_version, seed, config_hash FROM batches", con),
-                hide_index=True, use_container_width=True)
-            n_ev = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            st.markdown(f"**{n_ev} hash-chained events.** Each event stores the hash of the one before it.")
-            st.dataframe(pd.read_sql_query(
-                "SELECT id, batch_id, source, event_type, substr(hash,1,12) AS hash FROM events ORDER BY id LIMIT 40", con),
-                hide_index=True, use_container_width=True)
-            if st.button("Tamper with one log entry"):
-                con.execute("UPDATE events SET payload_json='{}' WHERE id=2")
-                con.commit()
-                st.session_state["tampered"] = True
-            if st.session_state.get("tampered"):
-                ok = res["audit"].verify_chain()
-                (st.success if ok else st.error)(
-                    "Chain verifies." if ok else "Chain broken: the edit to event 2 was detected. Run a new campaign to reset.")
+    p_values = np.sum(permuted_vips >= actual_vips, axis=0) / n_permutations
+    return actual_vips, p_values
+
+
+def batch_ode(y: list, t: float, mu_max: float, Ks: float, Y_xs: float, kd: float, alpha: float, beta: float) -> list:
+    Xv, S, V, P = y
+    
+    # ODE CLAMPING
+    Xv_safe = max(0.0, Xv)
+    S_safe = max(0.0, S)
+
+    mu = mu_max * S_safe / (Ks + S_safe)
+    
+    dXvdt = (mu - kd) * Xv_safe
+    dSdt = -(1 / Y_xs) * mu * Xv_safe
+    dVdt = 0.0 
+    dPdt = alpha * mu * Xv_safe + beta * Xv_safe
+    
+    return [dXvdt, dSdt, dVdt, dPdt]
+
+
+def simulate_impulsive_kinetics(t_vals: np.ndarray, y0: list, params: list, feed_schedule: dict, S_in_basal: float, S_in_gluc: float, samp_vol: float) -> np.ndarray:
+    mu_max, Ks, Y_xs, kd, alpha, beta = params
+    y_sim = [y0]
+    y_curr = y0.copy()
+    
+    for i in range(1, len(t_vals)):
+        t_span = [t_vals[i - 1], t_vals[i]]
+        current_time = t_vals[i]
+        
+        sol = odeint(batch_ode, y_curr, t_span, args=(mu_max, Ks, Y_xs, kd, alpha, beta))
+        y_next = list(sol[-1].copy())
+        
+        y_next[2] = max(0.01, y_next[2] - samp_vol)
+        
+        if current_time in feed_schedule:
+            F_basal, F_gluc = feed_schedule[current_time]
+            V_old = y_next[2]
+            V_new = V_old + F_basal + F_gluc
+            
+            Xv_old, S_old, P_old = y_next[0], y_next[1], y_next[3]
+            
+            y_next[0] = Xv_old * V_old / V_new
+            y_next[1] = (S_old * V_old + (F_basal * S_in_basal) + (F_gluc * S_in_gluc)) / V_new
+            y_next[2] = V_new
+            y_next[3] = P_old * V_old / V_new
+            
+        y_sim.append(y_next)
+        y_curr = y_next
+        
+    return np.array(y_sim)
+
+
+@st.cache_data
+def fit_impulsive_kinetic_model(t_vals: np.ndarray, X_actual: np.ndarray, S_actual: np.ndarray, V_actual: np.ndarray, P_actual: np.ndarray, feed_schedule: dict, S_in_basal: float, S_in_gluc: float, samp_vol: float) -> tuple:
+    def objective(params):
+        y0 = [X_actual[0], S_actual[0], V_actual[0], P_actual[0]]
+        sol = simulate_impulsive_kinetics(t_vals, y0, params, feed_schedule, S_in_basal, S_in_gluc, samp_vol)
+        
+        if np.isnan(sol).any():
+            return 1e9 
+        
+        err_X = np.sum(((X_actual - sol[:, 0]) / max(1e-9, np.max(X_actual))) ** 2)
+        err_S = np.sum(((S_actual - sol[:, 1]) / max(1e-9, np.max(S_actual))) ** 2)
+        err_V = np.sum(((V_actual - sol[:, 2]) / max(1e-9, np.max(V_actual))) ** 2)
+        err_P = np.sum(((P_actual - sol[:, 3]) / max(1e-9, np.max(P_actual))) ** 2)
+        
+        return err_X + err_S + err_V + err_P
+
+    bounds = [(0.01, 0.2), (0.1, 20), (0.1, 5.0), (0.001, 0.1), (0.0, 0.5), (0.0, 0.1)]
+    res = minimize(objective, [0.05, 5.0, 0.5, 0.01, 0.05, 0.01], bounds=bounds, method='L-BFGS-B')
+    
+    y0 = [X_actual[0], S_actual[0], V_actual[0], P_actual[0]]
+    sol_opt = simulate_impulsive_kinetics(t_vals, y0, res.x, feed_schedule, S_in_basal, S_in_gluc, samp_vol)
+
+    r2_x = r2_score(X_actual, sol_opt[:, 0])
+    r2_s = r2_score(S_actual, sol_opt[:, 1])
+    r2_p = r2_score(P_actual, sol_opt[:, 3])
+    
+    return res.x, sol_opt, r2_x, r2_s, r2_p, res.success
+
+
+def get_fuzzy_index(cols: list, keywords: list, default: int = 0) -> int:
+    for i, c in enumerate(cols):
+        if any(k in c.lower() for k in keywords):
+            return i
+    return default
+
+
+# ==========================================
+# UI: SIDEBAR & INGESTION
+# ==========================================
+raw_df = None
+uploaded_file = None
+
+brand_header("BatchSight", "BatchSight", "Understand your fed-batch data, and catch drift early.",
+             "Bioprocess digital twin and multivariate analysis")
+section = section_nav()
 
 if section == "About this project":
     render_about()
+    brand_footer()
+    st.stop()
+
+if section == "Try with your data":
+    st.markdown('<div class="lp-h" style="margin-top:1.4rem">Upload your batch data</div>'
+                '<div class="lp-lead">One CSV, one row per time point. Include a batch identifier, a time column, your process '
+                'variables and one target such as titer. You map the columns in the side panel, and at least five batches are needed.</div>',
+                unsafe_allow_html=True)
+    c_up, c_fmt = st.columns([3, 2])
+    with c_up:
+        uploaded_file = st.file_uploader("Batch history (CSV, up to 5 MB)", type=["csv"])
+        if uploaded_file is not None and uploaded_file.size > 5_000_000:
+            st.error("File too large (max 5 MB). Please upload a smaller CSV.")
+            brand_footer()
+            st.stop()
+        st.caption("Switching to another section clears the uploaded file, so upload it again when you return.")
+    with c_fmt:
+        _example_csv = generate_fed_batch_data(10.0, 0.05, 0.05).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download example CSV (format template)",
+            data=_example_csv,
+            file_name="example_fed_batch_data.csv",
+            mime="text/csv",
+            help="Synthetic data showing the expected column layout. Edit it or upload it as-is to try the upload path.",
+        )
+    if uploaded_file is None:
+        brand_footer()
+        st.stop()
+
+with st.sidebar:
+    st.header("1. Data Source")
+    if uploaded_file is None:
+        st.info("Demo mode: simulated fed-batch data. Adjust the assumptions below, or open "
+                "'Try with your data' to analyse your own file.")
+    else:
+        st.info("Analysing your uploaded file. It stays in your browser and is gone when you close the tab. "
+                "Please still anonymise batch IDs.")
+
+    st.header("2. Reactor & Kinetic Assumptions")
+    if not uploaded_file:
+        init_vol = st.number_input("Initial Volume (L)", value=10.0, step=0.5, help="Starting volume for the built-in data simulator.")
+        feed_rate_synth = st.number_input("Simulated Feed Rate (L/hr)", value=0.05, step=0.01, help="Used exclusively by the data generator. Feed volumes are dynamically extracted for the ODE solver.")
+    else:
+        init_vol = None
+        feed_rate_synth = None
+        st.caption("Initial Volume is only used by the built-in simulator and is hidden while a file is uploaded.")
+
+    samp_vol = st.number_input("Sampling Vol. Removed (L/sample)", value=0.05, step=0.01)
+    s_in_basal = st.number_input("Basal Feed Substrate Conc. (g/L)", value=50.0, step=10.0)
+    s_in_gluc = st.number_input("Glucose Feed Substrate Conc. (g/L)", value=400.0, step=10.0)
+
+    try:
+        if uploaded_file:
+            raw_df = pd.read_csv(uploaded_file)
+            if st.session_state.get('last_uploaded') != uploaded_file.name:
+                log_action("File_Uploaded", details=f"Filename: {uploaded_file.name}")
+                st.session_state.last_uploaded = uploaded_file.name
+                
+            cols = list(raw_df.columns)
+            col_batch = st.selectbox("Batch ID", cols, index=get_fuzzy_index(cols, ["batch", "run", "id"]))
+            col_time = st.selectbox("Time", cols, index=get_fuzzy_index(cols, ["time", "hour", "day"], 1))
+            
+            valid_features = [c for c in cols if c not in [col_batch, col_time] and raw_df[c].dtype in [np.float64, np.int64]]
+            col_titer = st.selectbox("Target Variable (Yield / CQA)", valid_features, index=get_fuzzy_index(valid_features, ["titer", "yield", "igg", "frag", "agg"], 2))
+            
+            model_features = [c for c in valid_features if c != col_titer]
+            fuzzy_defaults = [c for c in model_features if any(k in c.lower() for k in ['vcd', 'viability', 'gluc', 'lac', 'amm', 'glut', 'ph', 'do', 'temp', 'agit', 'osm', 'agg', 'our', 'cer', 'base', 'feed', 'seed', 'pass'])]
+            if not fuzzy_defaults: fuzzy_defaults = model_features[:5]
+            
+            feature_cols = st.multiselect("Select Variables (CPPs & States)", model_features, default=fuzzy_defaults)
+        else:
+            st.caption("Using simulated process data.")
+            raw_df = generate_fed_batch_data(init_vol, feed_rate_synth, samp_vol)
+            
+            if not st.session_state.get('synthetic_logged'):
+                log_action("Synthetic_Data_Generated")
+                st.session_state.synthetic_logged = True
+                
+            col_batch, col_time = "Batch", "Time_Hours"
+            valid_targets = ["Titer", "Aggregation", "Fragmentation"]
+            col_titer = st.selectbox("Target Variable (Yield / CQA)", valid_targets, index=0)
+            
+            raw_feature_cols = [
+                "Passage_Number", "Seed_VCD", "Seed_Viability", "VCD", "Viability", 
+                "Glucose", "Lactate", "Ammonia", "Glutamine", "Osmolality", 
+                "pH", "DO", "Temperature", "Agitation", "OUR", "CER", 
+                "Base_Volume", "Feed_Volume_Basal", "Feed_Volume_Glucose", "Volume"
+            ]
+            feature_cols = [c for c in raw_feature_cols if c not in valid_targets]
+
+        static_candidates = ["Passage_Number", "Seed_VCD", "Seed_Viability"]
+        static_vars = [f for f in feature_cols if f in static_candidates]
+        dynamic_vars = [f for f in feature_cols if f not in static_candidates]
+
+        control_vars = st.multiselect("Flag Controllable Levers (Optimizer)", dynamic_vars, default=[c for c in ["Glucose", "Glutamine", "pH", "Agitation"] if c in dynamic_vars])
+
+        st.header("3. Processing Parameters")
+        scale_vars = st.checkbox("Mean-center & Scale Variables (UV)", value=True)
+        
+        if uploaded_file:
+            process_max = int(raw_df.groupby(col_batch)[col_time].max().max())
+            process_min = int(raw_df.groupby(col_batch)[col_time].max().min())
+            
+            early_cap = max(1, process_max)
+            pca_cap = max(1, process_max)
+            
+            early_def = max(1, min(72, process_min))
+            pca_def = max(1, min(168, process_min))
+            
+            early_tp = st.number_input("PLS Prediction Window (Time Units)", min_value=1, max_value=early_cap, value=early_def)
+            pca_tp = st.number_input("PCA Anomaly Detection Window (Time Units)", min_value=1, max_value=pca_cap, value=pca_def)
+            grid_step = 24 if process_max > 48 else max(1, process_max // 4)
+        else:
+            early_tp = st.number_input("PLS Prediction Window (Hours)", min_value=24, max_value=200, value=72, step=24)
+            pca_tp = st.number_input("PCA Anomaly Detection Window (Hours)", min_value=24, max_value=350, value=168, step=24)
+            grid_step = 24
+
+        st.header("4. Mechanistic Identities")
+        bio_col = st.selectbox("Viable Biomass (Xv)", feature_cols, index=get_fuzzy_index(feature_cols, ["vcd", "cell", "bio"]))
+        sub_col = st.selectbox("Limiting Substrate (S)", feature_cols, index=get_fuzzy_index(feature_cols, ["gluc"]))
+        vol_col = st.selectbox("Reactor Volume (V)", feature_cols, index=get_fuzzy_index(feature_cols, ["vol"]))
+
+    except Exception as e:
+        log_action("Ingestion_Error", status="FAIL", details=str(e))
+        st.error(f"Data mapping error. Please check CSV schema: {str(e)}")
+        st.stop()
+
+
+if uploaded_file:
+    all_plot_cols = valid_features
+else:
+    all_plot_cols = raw_feature_cols + valid_targets
+
+df, dropped_rows = clean_numeric_data(raw_df, list(set(all_plot_cols + [col_time, col_titer])))
+
+if dropped_rows > 0:
+    st.sidebar.warning(f"{dropped_rows} rows dropped during cleaning (non-numeric data).")
+    current_source = uploaded_file.name if uploaded_file else "synthetic_data"
+    drop_state_key = f"{current_source}_{dropped_rows}"
+    if st.session_state.get('last_drop_state') != drop_state_key:
+        log_action("Data_Cleaned", details=f"Source: {current_source} | Dropped: {dropped_rows} rows")
+        st.session_state.last_drop_state = drop_state_key
+
+
+# ==========================================
+# MAIN DASHBOARD UI
+# ==========================================
+st.info(
+    "**Free exploratory tool, not validated for GxP decisions.** "
+    "Want this applied to your own process? "
+    "[Book a free 30-min call](https://calendly.com/laganpathania940/30min) · "
+    "[LinkedIn](https://www.linkedin.com/in/lagan-pathania-814142118/) · "
+    "[hello@laganpathania.com](mailto:hello@laganpathania.com)"
+)
+
+pls_time_grid = np.arange(grid_step, early_tp + grid_step, grid_step)
+df_pls_unfolded, valid_pls_batches = interpolate_batch_trajectories(df, col_batch, col_time, dynamic_vars, static_vars, pls_time_grid)
+
+if len(valid_pls_batches) < 5:
+    log_action("MVDA_Pipeline_Failed", status="FAIL", details=f"Insufficient batches: {len(valid_pls_batches)}")
+    st.error(rf"**Data Starvation Error:** Only {len(valid_pls_batches)} batches survived interpolation out to {early_tp} time units. K-Fold Cross Validation requires $N \ge 5$. Reduce the Prediction Window slider to a timepoint that more batches reach.")
+    st.stop()
+
+Y_global = df.groupby(col_batch)[col_titer].max().reindex(df_pls_unfolded.index).values
+X_global = df_pls_unfolded.values
+
+scaler_global = StandardScaler().fit(X_global) if scale_vars else None
+X_scaled_global = scaler_global.transform(X_global) if scale_vars else X_global
+
+pipeline_hash = hash(X_scaled_global.tobytes() + Y_global.tobytes())
+if st.session_state.get('last_pipeline_hash') != pipeline_hash:
+    log_action("MVDA_Pipeline_Initiated", details=f"n_samples={X_scaled_global.shape[0]}, n_vars={X_scaled_global.shape[1]}, target={col_titer}")
+    st.session_state.last_pipeline_hash = pipeline_hash
+
+global_model, global_rmsecv, global_k, global_ypred = robust_pls_pipeline(X_scaled_global, Y_global)
+baseline_rmse = np.std(Y_global)
+err_reduction = ((baseline_rmse - global_rmsecv) / baseline_rmse) * 100
+
+col_m1, col_m2, col_m3 = st.columns(3)
+col_m1.metric("Latent Variables (Auto-Tuned)", f"{global_k}")
+col_m2.metric(f"RMSECV ({col_titer})", f"{global_rmsecv:.3f}")
+col_m3.metric("Predictive Error Reduction", f"{err_reduction:.1f}%", "vs Baseline Variance")
+st.markdown("<br>", unsafe_allow_html=True)
+
+tab_evo, tab_pca, tab_pls, tab_kin, tab_opt = st.tabs([
+    "1. Batch Evolution", "2. Multivariate (PCA)", "3. Predictive (PLS)", "4. Kinetic (ODE)", "5. Prescriptive Optimizer"
+])
+
+# --- TAB 1: BATCH EVOLUTION ---
+with tab_evo:
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        visual_options = [c for c in df.columns if c not in [col_batch, col_time]]
+        selected_var = st.selectbox(
+            "Select Analyte / CPP", 
+            visual_options, 
+            index=visual_options.index(col_titer) if col_titer in visual_options else 0
+        )
+        
+        view_mode = st.radio("Display Unit", ["Concentration / Value", "Absolute Mass (g)"])
+        
+    with col2:
+        df_plot = df.copy()
+        y_title = f"{selected_var}"
+        
+        unit_exclusion_list = ["pH", "DO", "Temperature", "Agitation", "Viability", "Osmolality", "Aggregation", "Fragmentation", "Passage_Number", "Seed_VCD", "Seed_Viability", "OUR", "CER", "Base_Volume", "Feed_Volume_Basal", "Feed_Volume_Glucose", vol_col]
+        if view_mode == "Absolute Mass (g)" and selected_var not in unit_exclusion_list:
+            df_plot[selected_var] = df_plot[selected_var] * df_plot[vol_col]
+            y_title = f"Absolute {selected_var} Mass (g)"
+
+        fig_evo = px.line(df_plot, x=col_time, y=selected_var, color=col_batch, markers=True, title=f"Longitudinal Trajectory: {y_title}")
+        fig_evo.update_traces(line=dict(width=1.5), marker=dict(size=7, line=dict(width=0.75, color="white")))
+        fig_evo.update_layout(**pub_layout)
+        st.plotly_chart(fig_evo, use_container_width=True, config={"displayModeBar": True})
+
+# --- TAB 2: MULTIVARIATE (PCA) ---
+with tab_pca:
+    pca_time_grid = np.arange(grid_step, pca_tp + grid_step, grid_step)
+    df_pca_unfolded, valid_pca_batches = interpolate_batch_trajectories(df, col_batch, col_time, dynamic_vars, static_vars, pca_time_grid)
+    X_pca_raw = df_pca_unfolded.values
+    X_pca_scaled = StandardScaler().fit_transform(X_pca_raw) if scale_vars else X_pca_raw
+    
+    pca = PCA(n_components=2)
+    X_pca_scores = pca.fit_transform(X_pca_scaled)
+    var_exp = pca.explained_variance_ratio_ * 100
+
+    df_pca = pd.DataFrame(X_pca_scores, columns=["PC1", "PC2"], index=df_pca_unfolded.index)
+
+    if "Excursion" in raw_df.columns:
+        batch_meta = raw_df[[col_batch, "Excursion"]].drop_duplicates().set_index(col_batch)
+        df_pca = df_pca.join(batch_meta).reset_index()
+        color_arg = "Excursion"
+    else:
+        df_pca = df_pca.reset_index()
+        color_arg = None
+
+    pub_colors = {"None": "#2d6a4f", "Contamination": "#bc4749", "Feed Pump Fault": "#e09f3e"}
+
+    fig_pca = px.scatter(
+        df_pca, x="PC1", y="PC2", color=color_arg, text="Batch",
+        color_discrete_map=pub_colors if color_arg == "Excursion" else None,
+        labels={"PC1": f"PC1 ({var_exp[0]:.1f}% Var.)", "PC2": f"PC2 ({var_exp[1]:.1f}% Var.)"},
+    )
+
+    x_ell, y_ell = draw_hotellings_t2_ellipse(X_pca_scores, n_samples=len(X_pca_scores), k_comp=2)
+    if x_ell is not None:
+        fig_pca.add_trace(go.Scatter(x=x_ell, y=y_ell, mode="lines", name="95% Control Limit", line=dict(color="black", dash="dash", width=1)))
+
+    fig_pca.add_hline(y=0, line_width=0.75, line_color="rgba(0,0,0,0.3)")
+    fig_pca.add_vline(x=0, line_width=0.75, line_color="rgba(0,0,0,0.3)")
+
+    fig_pca.update_traces(
+        marker=dict(size=9, line=dict(width=0.75, color="black")),
+        textposition="top center", textfont=dict(size=9, color="#1a1a1a", family=pub_font_family),
+        selector=dict(mode="markers+text"),
+    )
+    
+    fig_pca.update_layout(**pub_layout)
+    fig_pca.update_layout(
+        title=dict(text=f"Batch Clustering — PCA Score Plot (Window: {pca_tp} hrs)", font=dict(size=14), x=0.02, y=0.96, xanchor="left", yanchor="top"),
+        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5),
+        width=640, height=500, margin=dict(t=80, l=60, r=30, b=100),
+    )
+    st.plotly_chart(fig_pca, use_container_width=False, config={"displayModeBar": True})
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    brand_colorscale = [[0, "#bc4749"], [0.5, "#ffffff"], [1, "#2d6a4f"]]
+    corr_matrix = df_pca_unfolded.corr()
+    n_vars = corr_matrix.shape[0]
+    var_labels = list(corr_matrix.columns)
+
+    tick_step = max(1, n_vars // 20)
+    tickvals = list(range(0, n_vars, tick_step))
+    ticktext = [var_labels[i] for i in tickvals]
+
+    fig_corr = px.imshow(
+        corr_matrix, color_continuous_scale=brand_colorscale, zmin=-1, zmax=1,
+        text_auto=".2f" if n_vars <= 12 else False,
+    )
+    fig_corr.update_traces(textfont=dict(size=8, family=pub_font_family))
+    
+    fig_corr.update_layout(**pub_layout)
+    fig_corr.update_layout(
+        title=dict(text=f"Cross-Correlation Matrix (Up to {pca_tp} hrs, n={n_vars})", font=dict(size=14), x=0.02, xanchor="left"),
+        xaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ticktext, tickangle=-45, tickfont=dict(size=8), showline=True, linecolor="black", mirror=True, showgrid=False, fixedrange=False),
+        yaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ticktext, tickfont=dict(size=8), showline=True, linecolor="black", mirror=True, showgrid=False, scaleanchor="x", scaleratio=1, fixedrange=False),
+        coloraxis_colorbar=dict(title=dict(text="ρ", font=dict(size=11)), thickness=14, len=0.8, tickfont=dict(size=9), outlinewidth=1, outlinecolor="black"),
+        width=620, height=620, margin=dict(t=60, l=90, r=40, b=90),
+    )
+    st.plotly_chart(fig_corr, use_container_width=False, config={"displayModeBar": True})
+
+# --- TAB 3: PREDICTIVE (PLS) ---
+with tab_pls:
+    st.markdown("**Statistical Note:** MVDA requires a dense batch history. A standard N=15 dataset exhibits high cross-validation variance. Production validation requires N > 30.")
+    col_pls1, col_pls2 = st.columns(2)
+    with col_pls1:
+        fig_cv = px.scatter(x=Y_global, y=global_ypred, labels={"x": f"Actual {col_titer}", "y": f"Predicted {col_titer}"}, title=f"Trajectory Predictions (Up to Day {early_tp/24:.0f})")
+        fig_cv.add_shape(type="line", x0=min(Y_global), y0=min(Y_global), x1=max(Y_global), y1=max(Y_global), line=dict(color="black", dash="dash", width=1.5))
+        fig_cv.update_traces(marker=dict(size=9, color="#2d6a4f", line=dict(width=1, color="black")))
+        fig_cv.update_layout(**pub_layout)
+        st.plotly_chart(fig_cv, use_container_width=True, config={"displayModeBar": True})
+
+    with col_pls2:
+        vips, p_vals = permutation_test_vip(global_model, X_scaled_global, Y_global, global_k)
+        vip_df = pd.DataFrame({"Analyte": df_pls_unfolded.columns, "VIP Score": vips, "p-value": p_vals}).sort_values("VIP Score", ascending=False).head(15)
+
+        fig_vip = px.bar(vip_df, x="VIP Score", y="Analyte", orientation="h", title=f"Top 15 Drivers of {col_titer}")
+        fig_vip.add_vline(x=1.0, line_dash="dash", line_color="black", line_width=1.5)
+
+        marker_colors = ["#2d6a4f" if p < 0.05 else "#cccccc" for p in vip_df["p-value"]]
+        fig_vip.update_traces(marker_color=marker_colors, marker_line_color="black", marker_line_width=1)
+        fig_vip.update_layout(**pub_layout)
+        st.plotly_chart(fig_vip, use_container_width=True, config={"displayModeBar": True})
+        st.caption("Grey bars represent variables where VIP > 1 may be due to noise (p ≥ 0.05).")
+
+# --- TAB 4: KINETIC (MECHANISTIC ODE) ---
+with tab_kin:
+    st.markdown("**Modeling Mechanics:** The mechanistic solver isolates batch kinetics natively and integrates impulsive mass-balance jumps extracted directly from historical feed schedules.")
+    valid_kin_batches = [b for b in df[col_batch].unique() if len(df[df[col_batch] == b]) > 2]
+    batch_sel = st.selectbox("Select Batch to Fit", valid_kin_batches)
+
+    if st.button("Fit Impulsive Kinetics", key="fit_ode_btn"):
+        st.write(f"**Fitting data for {batch_sel}...**")
+        log_action("Kinetics_Fitted", details=f"Batch: {batch_sel}")
+        
+        b_data = df[df[col_batch] == batch_sel].sort_values(col_time)
+        t_data = b_data[col_time].values
+        x_data = b_data[bio_col].values
+        s_data = b_data[sub_col].values
+        v_data = b_data[vol_col].values
+        p_data = b_data[col_titer].values if col_titer in b_data.columns else b_data["Titer"].values
+        
+        feed_schedule = {}
+        prev_cum_basal = 0.0
+        prev_cum_gluc = 0.0
+        
+        for _, row in b_data.iterrows():
+            t = row[col_time]
+            cum_basal = row.get("Feed_Volume_Basal", 0.0)
+            cum_gluc = row.get("Feed_Volume_Glucose", 0.0)
+            
+            f_basal = cum_basal - prev_cum_basal
+            f_gluc = cum_gluc - prev_cum_gluc
+            
+            if f_basal > 0 or f_gluc > 0:
+                feed_schedule[t] = (f_basal, f_gluc)
+                
+            prev_cum_basal = cum_basal
+            prev_cum_gluc = cum_gluc
+
+        opt_params, sol_opt, r2_x, r2_s, r2_p, success = fit_impulsive_kinetic_model(
+            t_data, x_data, s_data, v_data, p_data, feed_schedule, s_in_basal, s_in_gluc, samp_vol
+        )
+
+        col_k1, col_k2 = st.columns([3, 1.2])
+        with col_k1:
+            fig_ode = go.Figure()
+            fig_ode.add_trace(go.Scatter(x=t_data, y=s_data, mode="markers", name=f"Actual {sub_col}", marker=dict(color="#354a3e", size=9, line=dict(width=1, color="black"))))
+            fig_ode.add_trace(go.Scatter(x=t_data, y=sol_opt[:, 1], mode="lines", name=f"ODE Fit ({sub_col})", line=dict(color="#354a3e", dash="dot", width=2)))
+            
+            fig_ode.add_trace(go.Scatter(x=t_data, y=x_data, mode="markers", name=f"Actual {bio_col}", marker=dict(color="#2d6a4f", size=9, line=dict(width=1, color="black"))))
+            fig_ode.add_trace(go.Scatter(x=t_data, y=sol_opt[:, 0], mode="lines", name=f"ODE Fit ({bio_col})", line=dict(color="#2d6a4f", dash="dot", width=2)))
+            
+            fig_ode.add_trace(go.Scatter(x=t_data, y=p_data, mode="markers", name="Actual Target", marker=dict(color="#118ab2", size=9, symbol="triangle-up", line=dict(width=1, color="black"))))
+            fig_ode.add_trace(go.Scatter(x=t_data, y=sol_opt[:, 3], mode="lines", name="ODE Fit (Target)", line=dict(color="#118ab2", dash="solid", width=2)))
+            
+            fig_ode.update_layout(**pub_layout)
+            st.plotly_chart(fig_ode, use_container_width=True, config={"displayModeBar": True})
+
+        with col_k2:
+            m1, m2 = st.columns(2)
+            m1.metric("μ_max (Growth)", f"{opt_params[0]:.3f}")
+            m2.metric("Ks (Half-Sat)", f"{opt_params[1]:.2f}")
+            m1.metric("Y_xs (Yield)", f"{opt_params[2]:.2f}")
+            m2.metric("kd (Death)", f"{opt_params[3]:.4f}")
+            m1.metric("α (Growth Prod.)", f"{opt_params[4]:.3f}")
+            m2.metric("β (Non-Gr. Prod.)", f"{opt_params[5]:.4f}")
+            
+            st.divider()
+            f1, f2 = st.columns(2)
+            f1.metric(f"{bio_col} (R²)", f"{r2_x:.3f}")
+            f2.metric("Target (R²)", f"{r2_p:.3f}")
+
+# --- TAB 5: PRESCRIPTIVE OPTIMIZER ---
+with tab_opt:
+    st.warning("**Causality Disclaimer:** This optimizer searches a *correlational* PLS space. Downstream state variables are mathematically 'locked' during optimization to isolate the feed effect.")
+
+    if control_vars:
+        if st.button("Search Optimal Target Point"):
+            log_action("Optimizer_Executed", details=f"Controls: {control_vars}, Target: {col_titer}")
+            ctrl_idx = [list(df_pls_unfolded.columns).index(f"{c}_Hr{int(early_tp)}") for c in control_vars]
+            day_snap = df_pls_unfolded.mean().values
+
+            hist_min = df_pls_unfolded.values[:, ctrl_idx].min(axis=0)
+            hist_max = df_pls_unfolded.values[:, ctrl_idx].max(axis=0)
+
+            def obj_func(x_ctrl):
+                x_full = day_snap.copy()
+                for idx, val in zip(ctrl_idx, x_ctrl):
+                    x_full[idx] = val
+                x_full_scaled = scaler_global.transform([x_full]) if scale_vars else [x_full]
+                
+                prediction = global_model.predict(x_full_scaled).item()
+                if col_titer in ["Fragmentation", "Aggregation"]: return prediction
+                return -prediction
+
+            x0_ctrl = [day_snap[i] for i in ctrl_idx]
+            bounds = [(max(0.0, v * 0.5 - 0.5), v * 1.5 + 0.5) for v in x0_ctrl]
+            res = minimize(obj_func, x0_ctrl, method="L-BFGS-B", bounds=bounds)
+
+            if res.success:
+                final_val = res.fun if col_titer in ["Fragmentation", "Aggregation"] else -res.fun
+                st.success(f"Algorithm Converged! Predicted {col_titer}: **{final_val:.2f}**")
+
+                extrapolating = any((res.x < hist_min) | (res.x > hist_max))
+                if extrapolating:
+                    st.error("**Out of Distribution Warning:** The recommended control setpoint requires extrapolating outside the historical multivariate training envelope. Proceed with caution in physical scale-up.")
+
+                res_df = pd.DataFrame({
+                    "Variable": control_vars,
+                    "Historical Mean": x0_ctrl,
+                    "Recommended": res.x,
+                    "Delta": res.x - x0_ctrl,
+                })
+                st.dataframe(res_df.style.format({"Historical Mean": "{:.2f}", "Recommended": "{:.2f}", "Delta": "{:+.2f}"}))
+
+st.markdown("---")
+st.markdown(
+    "<p style='font-size:0.9rem;'>© Lagan Pathania · "
+    "<a href='https://laganpathania.com' target='_blank'>laganpathania.com</a> · "
+    "<a href='https://laganpathania.com/impressum.html' target='_blank'>Impressum</a> · "
+    "<a href='https://laganpathania.com/datenschutz.html' target='_blank'>Datenschutz</a></p>",
+    unsafe_allow_html=True,
+)
+
 
 brand_footer()
